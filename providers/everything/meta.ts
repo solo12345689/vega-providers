@@ -71,7 +71,9 @@ export const getMeta = async function ({
         });
         seasons.set(video.season, episodes);
       }
-      const skipTimings = await providerContext.kvStore?.get<boolean>("torrentio_skipTimings");
+      const skipTimings = await providerContext.kvStore?.get<boolean>(
+        "everything_skipTimings",
+      );
       for (const season of [...seasons.keys()].sort((a, b) => a - b)) {
         const seasonEpisodes = seasons.get(season) || [];
         if (seasonEpisodes.length === 0) continue;
@@ -99,8 +101,8 @@ export const getMeta = async function ({
         directLinks: [
           {
             title: "Movie",
-            type: "movie",
             link: createPayload(imdbId, "movie", meta),
+            type: "movie",
           },
         ],
       });
@@ -110,15 +112,14 @@ export const getMeta = async function ({
       {
         title: meta.name || "",
         synopsis: meta.description || "",
-        image: meta.background || meta.poster || "",
-        poster: meta.poster || "",
-        imdbId: imdbId || meta.imdb_id || "",
+        image: meta.poster || "",
+        imdbId,
         type,
         linkList,
       },
       meta,
     );
   } catch (err) {
-    throwProviderError("Torrentio", "metadata", err);
+    throwProviderError("Everything", "metadata", err);
   }
 };
