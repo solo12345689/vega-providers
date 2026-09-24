@@ -71,9 +71,15 @@ export const unlockNetMirrorMobileSession = async (
       timeout: 8000,
     });
 
-    const setCookies = homeRes.headers?.["set-cookie"] || [];
+    const setCookies =
+      homeRes.headers?.["set-cookie"] ||
+      homeRes.headers?.["x-set-cookie"] ||
+      [];
     const cookiesArr = Array.isArray(setCookies) ? setCookies : [setCookies];
-    const initialCookie = cookiesArr.map((c: string) => c.split(";")[0]).join("; ");
+    const initialCookie = cookiesArr
+      .map((c: string) => String(c).split(";")[0])
+      .filter(Boolean)
+      .join("; ");
 
     const html = typeof homeRes.data === "string" ? homeRes.data : "";
     const matchAddHash = html.match(/data-addhash=["']([^"']+)["']/);
@@ -130,10 +136,13 @@ export const unlockNetMirrorMobileSession = async (
           }
         );
 
-        const vSetCookies = vRes.headers?.["set-cookie"] || [];
+        const vSetCookies =
+          vRes.headers?.["set-cookie"] ||
+          vRes.headers?.["x-set-cookie"] ||
+          [];
         const vCookiesArr = Array.isArray(vSetCookies) ? vSetCookies : [vSetCookies];
         for (const sc of vCookiesArr) {
-          if (sc.includes("t_hash_t=")) {
+          if (typeof sc === "string" && sc.includes("t_hash_t=")) {
             const tokenMatch = sc.match(/t_hash_t=([^;]+)/);
             if (tokenMatch && !tokenMatch[1].includes("::99")) {
               verifiedToken = decodeURIComponent(tokenMatch[1]);
@@ -159,10 +168,13 @@ export const unlockNetMirrorMobileSession = async (
             })
             .catch(() => null);
 
-          const rSetCookies = reloadRes?.headers?.["set-cookie"] || [];
+          const rSetCookies =
+            reloadRes?.headers?.["set-cookie"] ||
+            reloadRes?.headers?.["x-set-cookie"] ||
+            [];
           const rCookiesArr = Array.isArray(rSetCookies) ? rSetCookies : [rSetCookies];
           for (const sc of rCookiesArr) {
-            if (sc.includes("t_hash_t=")) {
+            if (typeof sc === "string" && sc.includes("t_hash_t=")) {
               const tokenMatch = sc.match(/t_hash_t=([^;]+)/);
               if (tokenMatch && !tokenMatch[1].includes("::99")) {
                 verifiedToken = decodeURIComponent(tokenMatch[1]);
@@ -200,19 +212,34 @@ export const getNetMirrorCookie = async (
   let t_hash_t: string | undefined;
   try {
     if (kvStore) {
-      const userToken = await kvStore.get<string>("t_hash_t");
-      if (userToken && userToken.trim() && !userToken.includes("::99")) {
-        t_hash_t = userToken.trim();
-      } else {
-        const cached = await kvStore.get<{ token: string; ts: number }>("t_hash_t_data");
-        if (
-          cached &&
-          cached.token &&
-          !cached.token.includes("::99") &&
-          Date.now() - cached.ts < 43200000
-        ) {
-          t_hash_t = cached.token;
+      const cached = await kvStore.get<{ token: string; ts: number }>("t_hash_t_data");
+      if (
+        cached &&
+        cached.token &&
+        !cached.token.includes("::99") &&
+        Date.now() - cached.ts < 43200000
+      ) {
+        t_hash_t = cached.token;
+      }
+
+      if (!t_hash_t) {
+        const userToken = await kvStore.get<string>("t_hash_t");
+        if (userToken && userToken.trim() && !userToken.includes("::99")) {
+          const parts = userToken.trim().split("::");
+          if (parts.length >= 3) {
+            const tokenSec = parseInt(parts[2], 10);
+            if (!isNaN(tokenSec) && Date.now() / 1000 - tokenSec < 43200) {
+              t_hash_t = userToken.trim();
+            }
+          }
         }
+      }
+
+      if (!t_hash_t) {
+        try {
+          await kvStore.delete("t_hash_t");
+          await kvStore.delete("t_hash_t_data");
+        } catch {}
       }
     }
   } catch {}
@@ -322,7 +349,7 @@ export const netMirrorSearch = async ({
   try {
     if (page > 1) return [];
     const { axios } = providerContext;
-    const baseUrl = await getNetMirrorBaseUrl();
+    const baseUrl = await getNetMirrorBaseUrl(providerContext);
     const query = searchQuery?.trim();
     if (!query) return [];
 
@@ -462,7 +489,7 @@ export const getCachedHomeTrays = async (
 
   try {
     const { axios, cheerio } = providerContext;
-    const baseUrl = await getNetMirrorBaseUrl();
+    const baseUrl = await getNetMirrorBaseUrl(providerContext);
     const cookies = await getNetMirrorCookie(providerContext, prefix);
     const url = `${baseUrl}/mobile/home?app=1`;
 
@@ -480,7 +507,47 @@ export const getCachedHomeTrays = async (
       timeout: 10000,
     });
 
-    let trays: HomeTray[] = parseHtmlTrays(res.data, cheerio);
+    const html = typeof res.data === "string" ? res.data : "";
+    let trays: HomeTray[] = parseHtmlTrays(html, cheerio);
+
+    // If home page returned the ad verification screen (data-addhash) or 0 trays because session is unverified:
+    if (
+      trays.length === 0 &&
+      (html.includes("data-addhash") ||
+        html.includes("verify2.php") ||
+        !cookies.includes("t_hash_t=") ||
+        cookies.includes("t_hash_t=;"))
+    ) {
+      if (providerContext.kvStore) {
+        try {
+          await providerContext.kvStore.delete("t_hash_t");
+          await providerContext.kvStore.delete("t_hash_t_data");
+        } catch {}
+      }
+
+      if (!unlockPromise) {
+        unlockPromise = unlockNetMirrorMobileSession(providerContext, baseUrl).finally(() => {
+          unlockPromise = null;
+        });
+      }
+      const newCookie = await unlockPromise;
+
+      if (newCookie && !newCookie.includes("::99")) {
+        const freshCookies = `t_hash_t=${newCookie}; hd=on; ott=${prefix === "hs" ? "dp" : prefix === "pv" ? "pv" : "nf"}`;
+        const retryRes = await axios.get(url, {
+          headers: {
+            ...getNetMirrorMobileHeaders(baseUrl, freshCookies),
+            Accept:
+              "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+            "X-Requested-With": "XMLHttpRequest",
+            Referer: `${baseUrl}/mobile/home?app=1`,
+          },
+          timeout: 10000,
+        });
+        trays = parseHtmlTrays(retryRes.data, cheerio);
+      }
+    }
 
     if (prefix === "hs") {
       try {
@@ -529,7 +596,7 @@ export const netMirrorGetPosts = async ({
   try {
     if (page > 1) return [];
     const { axios } = providerContext;
-    const baseUrl = await getNetMirrorBaseUrl();
+    const baseUrl = await getNetMirrorBaseUrl(providerContext);
     const prefixPath = prefix ? `${prefix}/` : "";
     const t = Math.round(Date.now() / 1000);
     const cleanFilter = (filter || "").trim().toLowerCase();
@@ -707,7 +774,7 @@ export const netMirrorGetMeta = async ({
   providerContext: ProviderContext;
 }): Promise<Info> => {
   const { axios } = providerContext;
-  const baseUrl = await getNetMirrorBaseUrl();
+  const baseUrl = await getNetMirrorBaseUrl(providerContext);
 
   let id = "";
   let prefix: NetMirrorOtt = defaultPrefix;
@@ -846,7 +913,7 @@ export const netMirrorGetEpisodes = async ({
   providerContext: ProviderContext;
 }): Promise<EpisodeLink[]> => {
   const { axios } = providerContext;
-  const baseUrl = await getNetMirrorBaseUrl();
+  const baseUrl = await getNetMirrorBaseUrl(providerContext);
   const t = Math.round(Date.now() / 1000);
 
   let sid = seasonId;
@@ -946,7 +1013,7 @@ export const netMirrorGetStream = async ({
   isDownload?: boolean;
 }): Promise<Stream[]> => {
   const { axios } = providerContext;
-  const baseUrl = await getNetMirrorBaseUrl();
+  const baseUrl = await getNetMirrorBaseUrl(providerContext);
 
   let id = rawId;
   let prefix = defaultPrefix;
@@ -1133,6 +1200,7 @@ export const netMirrorGetStream = async ({
       if (hadAbuseVideo) {
         if (providerContext.kvStore) {
           try {
+            await providerContext.kvStore.delete("t_hash_t");
             await providerContext.kvStore.delete("t_hash_t_data");
           } catch {}
         }
