@@ -1,8 +1,14 @@
 import { ProviderContext, Stream, TextTracks } from "../types";
 
 let cachedCode: string | null = null;
-let cachedServers: any[] | null = null;
-let lastServerFetchTime = 0;
+let cachedChunkUrl: string | null = null;
+let cachedServers: any[] = [
+  { name: "Lisbon", "4k": true },
+  { name: "Nebula" },
+  { name: "Solara" },
+  { name: "Athens" },
+];
+let lastServerFetchTime = Date.now();
 
 function safeBtoa(str: string): string {
   if (typeof btoa !== "undefined") return btoa(str);
@@ -44,6 +50,74 @@ function safeAtob(input: string): string {
   return output;
 }
 
+async function getCinejoyChunkUrl(
+  axios: any,
+  headers: any,
+  signal?: AbortSignal
+): Promise<string> {
+  if (cachedChunkUrl) return cachedChunkUrl;
+
+  const defaultUrl = "https://cinejoy.pk/_app/immutable/chunks/DHJgaGwg.js";
+  try {
+    const res = await axios.get(defaultUrl, { headers, timeout: 5000, signal });
+    if (
+      typeof res.data === "string" &&
+      res.data.includes("WebAssembly") &&
+      res.data.includes('+"/g"')
+    ) {
+      cachedChunkUrl = defaultUrl;
+      cachedCode = res.data;
+      return defaultUrl;
+    }
+  } catch {}
+
+  try {
+    const homeRes = await axios.get("https://cinejoy.pk", {
+      headers,
+      timeout: 6000,
+      signal,
+    });
+    const html = typeof homeRes.data === "string" ? homeRes.data : "";
+    const appMatch = html.match(
+      /_app\/immutable\/entry\/app\.[a-zA-Z0-9_-]+\.js/
+    );
+    if (appMatch) {
+      const appRes = await axios.get(`https://cinejoy.pk/${appMatch[0]}`, {
+        headers,
+        timeout: 6000,
+        signal,
+      });
+      const appText = typeof appRes.data === "string" ? appRes.data : "";
+      const node25Match = appText.match(/nodes\/25\.[a-zA-Z0-9_-]+\.js/);
+      if (node25Match) {
+        const node25Res = await axios.get(
+          `https://cinejoy.pk/_app/immutable/${node25Match[0]}`,
+          { headers, timeout: 6000, signal }
+        );
+        const node25Text =
+          typeof node25Res.data === "string" ? node25Res.data : "";
+        const chunkMatches = [
+          ...node25Text.matchAll(/chunks\/([a-zA-Z0-9_-]+\.js)/g),
+        ].map((m: any) => m[1]);
+
+        for (const ch of chunkMatches) {
+          const chUrl = `https://cinejoy.pk/_app/immutable/chunks/${ch}`;
+          const chRes = await axios.get(chUrl, { headers, timeout: 6000, signal });
+          const chText = typeof chRes.data === "string" ? chRes.data : "";
+          if (chText.includes("WebAssembly") && chText.includes('+"/g"')) {
+            cachedChunkUrl = chUrl;
+            cachedCode = chText;
+            return chUrl;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  cachedChunkUrl = defaultUrl;
+  return defaultUrl;
+}
+
 export async function extractCinejoyStreams({
   tmdbId,
   season,
@@ -67,8 +141,8 @@ export async function extractCinejoyStreams({
   const headers = {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    Origin: "https://cinejoy.to",
-    Referer: `https://cinejoy.to/watch/${isMovie ? "movie" : "tv"}/${tmdbId}${
+    Origin: "https://cinejoy.pk",
+    Referer: `https://cinejoy.pk/watch/${isMovie ? "movie" : "tv"}/${tmdbId}${
       isMovie ? "" : `/${season || 1}/${episode || 1}`
     }`,
     ...(commonHeaders || {}),
@@ -77,62 +151,109 @@ export async function extractCinejoyStreams({
   try {
     // 1. Fetch chunk code if not cached
     if (!cachedCode) {
-      const chunkRes = await axios.get(
-        "https://cinejoy.to/_app/immutable/chunks/DsIc7hoQ.js",
-        { headers, timeout: 8000, signal }
-      );
-      cachedCode = chunkRes.data;
+      const chunkUrl = await getCinejoyChunkUrl(axios, headers, signal);
+      if (!cachedCode) {
+        const chunkRes = await axios.get(chunkUrl, { headers, timeout: 8000, signal });
+        cachedCode = chunkRes.data;
+      }
     }
 
-    // 2. Fetch available servers (cache for 5 minutes)
+    // 2. Refresh available servers in background (cache for 5 minutes)
     const now = Date.now();
-    if (!cachedServers || now - lastServerFetchTime > 300000) {
+    if (now - lastServerFetchTime > 300000) {
+      axios
+        .get("https://api.wing.st/servers", { headers, timeout: 5000, signal })
+        .then((sRes: any) => {
+          if (sRes.data?.servers?.length) {
+            cachedServers = sRes.data.servers;
+            lastServerFetchTime = Date.now();
+          }
+        })
+        .catch(() => {});
+    }
+
+    // 3. Start fetching external subtitles and direct download links concurrently
+    const subPromise = (async (): Promise<any[]> => {
       try {
-        const sRes = await axios.get("https://api.shegu.st/servers", {
+        const subUrl = `https://subs.wing.st/subtitles?tmdb=${tmdbId}${
+          isMovie ? "" : `&season=${season || 1}&episode=${episode || 1}`
+        }`;
+        const subRes = await axios.get(subUrl, { headers, timeout: 5000, signal });
+        if (Array.isArray(subRes.data)) {
+          return subRes.data
+            .filter((sub: any) => sub && sub.url)
+            .map((sub: any) => ({
+              title: sub.display || sub.language || "Subtitle",
+              language: (sub.language || "en").slice(0, 2).toLowerCase(),
+              type: sub.type === "vtt" ? ("text/vtt" as const) : ("application/x-subrip" as const),
+              uri: sub.url,
+            }));
+        }
+      } catch {}
+      return [];
+    })();
+
+    const dlPromise = (async (): Promise<Stream[]> => {
+      try {
+        const dlUrl = `https://downloads.wing.st/${isMovie ? "movie" : "tv"}/${tmdbId}${
+          isMovie ? "" : `/${season || 1}/${episode || 1}`
+        }`;
+        const dlRes = await axios.get(dlUrl, {
           headers,
           timeout: 6000,
           signal,
         });
-        cachedServers = sRes.data?.servers || [];
-        lastServerFetchTime = now;
-      } catch {
-        if (!cachedServers?.length) {
-          cachedServers = [
-            { name: "Lisbon", "4k": true },
-            { name: "Nebula" },
-            { name: "Solara" },
-            { name: "Athens" },
-            { name: "Joy" },
-            { name: "Castle" },
-            { name: "Canaias" },
-          ];
+        const dlLinks = dlRes.data?.links || [];
+        const result: Stream[] = [];
+        for (const dl of dlLinks) {
+          if (!dl?.url) continue;
+          const srvName = dl.source || "Download";
+          const sizeTag = dl.size ? ` [${dl.size}]` : "";
+          result.push({
+            server: `Cinejoy - ${srvName}${sizeTag}`,
+            link: dl.url,
+            type: dl.url.includes(".m3u8") ? "m3u8" : "mkv",
+            quality: dl.quality ? String(dl.quality) : undefined,
+            headers: {
+              Referer: "https://cinejoy.pk/",
+              Origin: "https://cinejoy.pk",
+            },
+          });
         }
+        return result;
+      } catch {
+        return [];
       }
-    }
+    })();
 
-    // 3. Setup sandbox execution (zero Node.js dependencies, 100% WebWorker compatible)
+    // 4. Setup sandbox execution (zero Node.js dependencies, 100% WebWorker compatible)
     const sandbox: any = {
       console: { log: () => {}, warn: () => {}, error: () => {} },
-      caches: undefined,
+      caches: { open: async () => ({ match: () => null, put: () => {} }) },
       Map: Map,
       Set: Set,
       window: {
         location: {
-          origin: "https://cinejoy.to",
-          href: `https://cinejoy.to/watch/${isMovie ? "movie" : "tv"}/${tmdbId}${
+          origin: "https://cinejoy.pk",
+          href: `https://cinejoy.pk/watch/${isMovie ? "movie" : "tv"}/${tmdbId}${
             isMovie ? "" : `/${season || 1}/${episode || 1}`
           }`,
           pathname: `/watch/${isMovie ? "movie" : "tv"}/${tmdbId}${
             isMovie ? "" : `/${season || 1}/${episode || 1}`
           }`,
-          host: "cinejoy.to",
-          hostname: "cinejoy.to",
+          host: "cinejoy.pk",
+          hostname: "cinejoy.pk",
         },
+        localStorage: { getItem: () => null, setItem: () => {} },
       },
       document: {
-        referrer: "https://cinejoy.to/",
+        referrer: "https://cinejoy.pk/",
         title: "Cinejoy",
+        createElement: () => ({}),
+        head: { appendChild: () => {} },
+        body: { appendChild: () => {} },
       },
+      navigator: { onLine: true },
       URLSearchParams:
         typeof URLSearchParams !== "undefined" ? URLSearchParams : undefined,
       TextEncoder: typeof TextEncoder !== "undefined" ? TextEncoder : undefined,
@@ -153,13 +274,13 @@ export async function extractCinejoyStreams({
             },
             data: opts?.body,
             responseType: "arraybuffer",
-            timeout: 8000,
+            timeout: 6000,
             signal,
           });
           const rawData = fetchRes.data;
           const uint8 = new Uint8Array(rawData);
           return {
-            ok: true,
+            ok: fetchRes.status >= 200 && fetchRes.status < 300,
             status: fetchRes.status,
             text: async () => {
               try {
@@ -199,22 +320,33 @@ export async function extractCinejoyStreams({
     // Run using Function constructor
     const runner = new Function(
       "sandbox",
-      `with(sandbox) { ${cleanCode}; return { f0: typeof f0 !== "undefined" ? f0 : null, k0: typeof k0 !== "undefined" ? k0 : null }; }`
+      `with(sandbox) {
+        const u = new Proxy({}, { get: () => () => ({}) });
+        const B = () => ({});
+        const nW = () => ({});
+        ${cleanCode};
+        return {
+          resolveMovie: typeof pW !== "undefined" ? pW : (typeof k !== "undefined" ? k : null),
+          resolveTv: typeof qW !== "undefined" ? qW : (typeof l !== "undefined" ? l : null),
+        };
+      }`
     );
     const exportsObj = runner(sandbox);
 
     const activeServers = cachedServers || [];
     const streams: Stream[] = [];
 
-    // 4. Query active servers in parallel
+    // 5. Query active servers in parallel
+    const externalSubtitles = await subPromise;
+
     const tasks = activeServers.map(async (srv) => {
       const serverName = srv.name;
       try {
         let resData: any = null;
-        if (isMovie && exportsObj.f0) {
-          resData = await exportsObj.f0(serverName, String(tmdbId));
-        } else if (!isMovie && exportsObj.k0) {
-          resData = await exportsObj.k0(
+        if (isMovie && exportsObj.resolveMovie) {
+          resData = await exportsObj.resolveMovie(serverName, String(tmdbId));
+        } else if (!isMovie && exportsObj.resolveTv) {
+          resData = await exportsObj.resolveTv(
             serverName,
             String(tmdbId),
             Number(season || 1),
@@ -224,13 +356,15 @@ export async function extractCinejoyStreams({
 
         if (resData?.stream && Array.isArray(resData.stream)) {
           for (const item of resData.stream) {
-            const subtitles: TextTracks[] = (item.captions || []).map(
-              (c: any) => ({
+            const subtitles: TextTracks = [
+              ...(item.captions || []).map((c: any) => ({
                 title: c.id || c.language || "Subtitle",
-                file: c.url,
-                language: c.language || c.id,
-              })
-            );
+                uri: c.url,
+                type: (c.url && c.url.endsWith(".vtt") ? "text/vtt" : "application/x-subrip") as const,
+                language: (c.language || c.id || "en").slice(0, 2).toLowerCase(),
+              })),
+              ...externalSubtitles,
+            ];
 
             if (item.type === "hls" && item.playlist) {
               streams.push({
@@ -240,8 +374,8 @@ export async function extractCinejoyStreams({
                 quality: srv["4k"] ? "2160" : "1080",
                 subtitles: subtitles.length ? subtitles : undefined,
                 headers: {
-                  Referer: "https://cinejoy.to/",
-                  Origin: "https://cinejoy.to",
+                  Referer: "https://cinejoy.pk/",
+                  Origin: "https://cinejoy.pk",
                 },
               });
             } else if (item.type === "file" && item.qualities) {
@@ -258,8 +392,8 @@ export async function extractCinejoyStreams({
                       : undefined,
                     subtitles: subtitles.length ? subtitles : undefined,
                     headers: {
-                      Referer: "https://cinejoy.to/",
-                      Origin: "https://cinejoy.to",
+                      Referer: "https://cinejoy.pk/",
+                      Origin: "https://cinejoy.pk",
                     },
                   });
                 }
@@ -272,36 +406,13 @@ export async function extractCinejoyStreams({
       }
     });
 
-    await Promise.allSettled(tasks);
+    const [dlStreams] = await Promise.all([
+      dlPromise,
+      Promise.allSettled(tasks),
+    ]);
 
-    // 5. Fetch downloads.shegu.st direct links and append at the end
-    try {
-      const dlUrl = `https://downloads.shegu.st/${isMovie ? "movie" : "tv"}/${tmdbId}${
-        isMovie ? "" : `/${season || 1}/${episode || 1}`
-      }`;
-      const dlRes = await axios.get(dlUrl, {
-        headers,
-        timeout: 8000,
-        signal,
-      });
-      const dlLinks = dlRes.data?.links || [];
-      for (const dl of dlLinks) {
-        if (!dl?.url) continue;
-        const srvName = dl.source || "Download";
-        const sizeTag = dl.size ? ` [${dl.size}]` : "";
-        streams.push({
-          server: `Cinejoy - ${srvName}${sizeTag}`,
-          link: dl.url,
-          type: dl.url.includes(".m3u8") ? "m3u8" : "mkv",
-          quality: dl.quality ? String(dl.quality) : undefined,
-          headers: {
-            Referer: "https://cinejoy.to/",
-            Origin: "https://cinejoy.to",
-          },
-        });
-      }
-    } catch {
-      // Ignore if downloads endpoint has no entries for this title
+    if (dlStreams && dlStreams.length > 0) {
+      streams.push(...dlStreams);
     }
 
     return streams;
@@ -310,3 +421,4 @@ export async function extractCinejoyStreams({
     return [];
   }
 }
+

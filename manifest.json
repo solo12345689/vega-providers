@@ -11,7 +11,7 @@
   {
     "display_name": "MultiStream",
     "value": "autoEmbed",
-    "version": "2.9",
+    "version": "3.1",
     "icon": "https://cdn.jsdelivr.net/gh/Zenda-Cross/vega-providers@main/assets/autoEmbed.png",
     "type": "global",
     "disabled": false
@@ -45,7 +45,7 @@
   {
     "display_name": "Cinewood",
     "value": "1cinevood",
-    "version": "1.37",
+    "version": "1.38",
     "icon": "https://cdn.jsdelivr.net/gh/Zenda-Cross/vega-providers@main/assets/1cinevood.png",
     "type": "global",
     "disabled": false,
@@ -62,7 +62,7 @@
   {
     "display_name": "KatMoviesHd",
     "value": "katmovies",
-    "version": "1.36",
+    "version": "1.38",
     "icon": "https://cdn.jsdelivr.net/gh/Zenda-Cross/vega-providers@main/assets/katmovies.png",
     "type": "global",
     "disabled": false,
@@ -432,7 +432,7 @@
   {
     "display_name": "Everything",
     "value": "everything",
-    "version": "1.4",
+    "version": "1.5",
     "icon": "https://cdn.jsdelivr.net/gh/Zenda-Cross/vega-providers@main/assets/everything.png",
     "type": "global",
     "disabled": false
